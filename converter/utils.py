@@ -7,7 +7,7 @@ from google.appengine.datastore import entity_bytes_pb2 as entity_pb2
 from google.protobuf.json_format import MessageToDict
 
 
-def get_dest_dict(key, json_tree):
+def get_dest_dict(key, json_tree) -> dict:
     parent = key.parent()
     if parent is None:
         kind = key.kind()
@@ -47,24 +47,30 @@ def embedded_entity_to_dict(embedded_entity, data):
     ep.ParseFromString(embedded_entity)
     d = MessageToDict(ep)
     for entry in d.get("rawProperty", []):
-        name = entry.get("name")
-        value = entry.get("value")
-        multiple = entry.get("multiple")
-        if multiple and not name in data:
-            data[name] = []
+        name = entry["name"]
+        encoded_value = entry["value"]
+
+        # Nested object
         if entry.get("meaning") == "ENTITY_PROTO":
-            dt = {}
-            newdata = embedded_entity_to_dict(get_value(value, raw=True), dt)
-            if multiple:
-                data[name].append(newdata)
-            else:
-                data[name] = newdata
+            value = embedded_entity_to_dict(get_value(encoded_value, raw=True), {})
         else:
-            newdata = get_value(value)
-            if multiple:
-                data[name].append(newdata)
-            else:
-                data[name] = newdata
+            value = get_value(encoded_value)
+
+        # Value is array type
+        if entry["multiple"]:
+            data.setdefault(name, [])
+            data[name].append(value)
+        else:
+            # Assert we don't have already a value
+            assert data.get(name) is None
+            data[name] = value
+
+    # Empty arrays are stored in as different property in leveldb
+    for entry in d.get("property", []):
+        assert entry.get("meaning") == "EMPTY_LIST"
+        name = entry["name"]
+        data[name] = []
+
     return data
 
 

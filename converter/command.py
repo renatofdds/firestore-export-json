@@ -2,21 +2,35 @@ import argparse
 import json
 import os
 import sys
+
 from functools import partial
 from multiprocessing import Pool, cpu_count, Value
 from pathlib import Path
 from typing import Dict
 
-from google.appengine.api import datastore
 from google.appengine.api.datastore_types import EmbeddedEntity
 from google.appengine.datastore import entity_bytes_pb2 as entity_pb2
+from google.appengine.api.datastore import Entity
 
-from converter import records
-from converter.exceptions import BaseError, ValidationError
-from converter.utils import embedded_entity_to_dict, get_dest_dict, serialize_json
+from .exceptions import BaseError, ValidationError
+from .records import RecordsReader
+from .utils import embedded_entity_to_dict, serialize_json, get_dest_dict
 
-num_files: Value = Value("i", 0)
-num_files_processed: Value = Value("i", 0)
+num_files = Value("i", 0)
+num_files_processed = Value("i", 0)
+
+
+def parse_entity_field(value):
+    """Function for recursive parsing (e.g., arrays)"""
+
+    if isinstance(value, EmbeddedEntity):
+        # Some nested document
+        return embedded_entity_to_dict(value, {})
+
+    if isinstance(value, list):
+        return [parse_entity_field(x) for x in value]
+
+    return value
 
 
 def main(args=None):
@@ -96,6 +110,7 @@ def main(args=None):
             num_processes=args.processes,
             no_check_crc=args.no_check_crc,
         )
+
     except BaseError as e:
         print(str(e))
         sys.exit(1)
@@ -104,39 +119,50 @@ def main(args=None):
 def process_files(
     source_dir: str, dest_dir: str, num_processes: int, no_check_crc: bool
 ):
-    p = Pool(num_processes)
     files = sorted(os.listdir(source_dir))
     num_files.value = len(files)
     print(f"processing {num_files.value} file(s)")
 
-    f = partial(process_file, source_dir, dest_dir, no_check_crc)
-    p.map(f, files)
-    print(
-        f"processed: {num_files_processed.value}/{num_files.value} {num_files_processed.value/num_files.value*100}%"
-    )
+    if num_processes > 1:
+        p = Pool(num_processes)
+        p.map(partial(process_file, source_dir, dest_dir, no_check_crc), files)
+    else:
+        for f in files:
+            process_file(source_dir, dest_dir, no_check_crc, f)
+        print(
+            f"processed: {num_files_processed.value}/{num_files.value} {num_files_processed.value/num_files.value*100}%"
+        )
 
 
 def process_file(source_dir: str, dest_dir: str, no_check_crc: bool, filename: str):
     if not filename.startswith("output-"):
+        num_files_processed.value += 1
         return
-    json_tree: Dict = {}
+
+    json_tree: dict = {}
     in_file = os.path.join(source_dir, filename)
 
     with open(in_file, "rb") as raw:
-        reader = records.RecordsReader(raw, no_check_crc=no_check_crc)
+        reader = RecordsReader(raw, no_check_crc)
         for record in reader:
+            # Read the record as entity
             entity_proto = entity_pb2.EntityProto()
             entity_proto.ParseFromString(record)
-            ds_entity = datastore.Entity.FromPb(entity_proto)
-            data = {}
-            for name, value in list(ds_entity.items()):
-                if isinstance(value, EmbeddedEntity):
-                    dt: Dict = {}
-                    data[name] = embedded_entity_to_dict(value, dt)
-                else:
-                    data[name] = value
+            entity = Entity.FromPb(entity_proto)
 
-            data_dict = get_dest_dict(ds_entity.key(), json_tree)
+            # Parse the values
+            data = {}
+            for name, value in entity.items():
+                # NOTE: this check is unlikely, if we run into this we could use a different name
+                # or make it configurable. At least we will be aware when it happens :)
+                if name == "_key":
+                    raise RuntimeError(
+                        "Failed to parse document, _key already present."
+                    )
+
+                data[name] = parse_entity_field(value)
+
+            data_dict = get_dest_dict(entity.key(), json_tree)
             data_dict.update(data)
 
     out_file_path = os.path.join(dest_dir, filename + ".json")
@@ -144,6 +170,7 @@ def process_file(source_dir: str, dest_dir: str, no_check_crc: bool, filename: s
         out.write(
             json.dumps(json_tree, default=serialize_json, ensure_ascii=False, indent=2)
         )
+
     num_files_processed.value += 1
     if num_files.value > 0:
         print(
